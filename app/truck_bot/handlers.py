@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+from datetime import date, timedelta
+
+from aiogram import Router
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message
+
+from app.db import SessionLocal
+from app.models import Booking, BookingStatus, Driver, Elevator
+from app.queue_logic import recalc_queue
+from app.truck_bot import keyboards
+from app.truck_bot.states import BookingState
+from app.utils.time_utils import build_daily_slots, combine_date_time, now_tz, parse_date
+
+
+router = Router()
+
+
+def _get_or_create_driver(session, tg_user_id: int, tg_username: str | None) -> Driver:
+    driver = session.query(Driver).filter_by(telegram_user_id=tg_user_id).one_or_none()
+    if driver is None:
+        driver = Driver(telegram_user_id=tg_user_id, telegram_username=tg_username)
+        session.add(driver)
+        session.flush()
+    return driver
+
+
+def _available_slots(session, elevator: Elevator, booking_date: date) -> list[str]:
+    existing = (
+        session.query(Booking)
+        .filter(
+            Booking.elevator_id == elevator.id,
+            Booking.date == booking_date,
+            Booking.status != BookingStatus.CANCELLED,
+        )
+        .all()
+    )
+    taken = {b.slot_start.timetz() for b in existing}
+    slots = build_daily_slots(elevator.work_day_start, elevator.work_day_end, elevator.bookable_slots_per_day)
+    available = []
+    for slot_start, _ in slots:
+        if slot_start not in taken:
+            available.append(slot_start.strftime("%H:%M"))
+    return available
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Привет! Я бот очереди на элеватор. Используй /book для бронирования, /my_bookings чтобы увидеть записи и /help для подсказок."
+    )
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await message.answer(
+        "Доступные команды:\n"
+        "/book — забронировать слот\n"
+        "/my_bookings — мои бронирования\n"
+        "/help — справка"
+    )
+
+
+@router.message(Command("my_bookings"))
+async def cmd_my_bookings(message: Message) -> None:
+    with SessionLocal() as session:
+        driver = session.query(Driver).filter_by(telegram_user_id=message.from_user.id).one_or_none()
+        if driver is None:
+            await message.answer("Бронирования не найдены.")
+            return
+        now = now_tz()
+        bookings = (
+            session.query(Booking)
+            .filter(
+                Booking.driver_id == driver.id,
+                Booking.status != BookingStatus.CANCELLED,
+                Booking.slot_end >= now - timedelta(days=1),
+            )
+            .order_by(Booking.slot_start)
+            .all()
+        )
+        if not bookings:
+            await message.answer("Бронирования не найдены.")
+            return
+        lines = []
+        for b in bookings:
+            status = b.status
+            lines.append(
+                f"{b.date.isoformat()} {b.slot_start.astimezone(now.tzinfo).strftime('%H:%M')} — элеватор {b.elevator.name}, номер {b.license_plate}, статус {status}, позиция {b.queue_index}"
+            )
+        await message.answer("\n".join(lines))
+
+
+@router.message(Command("book"))
+async def cmd_book(message: Message, state: FSMContext) -> None:
+    with SessionLocal() as session:
+        elevators = session.query(Elevator).order_by(Elevator.name).all()
+        if not elevators:
+            await message.answer("Элеваторы не настроены. Свяжитесь с диспетчером.")
+            return
+    await state.set_state(BookingState.choosing_elevator)
+    await message.answer("Выберите элеватор:", reply_markup=keyboards.elevators_keyboard(elevators))
+
+
+@router.message(BookingState.choosing_elevator)
+async def choose_elevator(message: Message, state: FSMContext) -> None:
+    with SessionLocal() as session:
+        elevator = session.query(Elevator).filter_by(name=message.text).one_or_none()
+        if elevator is None:
+            await message.answer("Не могу найти такой элеватор. Выберите из списка.")
+            return
+    await state.update_data(elevator_id=elevator.id)
+    await state.set_state(BookingState.choosing_date)
+    await message.answer("Выберите дату (формат YYYY-MM-DD):", reply_markup=keyboards.dates_keyboard())
+
+
+@router.message(BookingState.choosing_date)
+async def choose_date(message: Message, state: FSMContext) -> None:
+    try:
+        booking_date = parse_date(message.text.strip())
+    except ValueError:
+        await message.answer("Дата должна быть в формате YYYY-MM-DD.")
+        return
+    if booking_date < date.today():
+        await message.answer("Нельзя выбрать прошедшую дату.")
+        return
+
+    data = await state.get_data()
+    elevator_id = data.get("elevator_id")
+    with SessionLocal() as session:
+        elevator = session.query(Elevator).get(elevator_id)
+        if elevator is None:
+            await message.answer("Элеватор не найден, начните заново /book.")
+            await state.clear()
+            return
+        slots = _available_slots(session, elevator, booking_date)
+    if not slots:
+        await message.answer("На эту дату нет свободных слотов. Выберите другую дату.", reply_markup=keyboards.dates_keyboard())
+        return
+    await state.update_data(date=booking_date.isoformat(), slots=slots)
+    await state.set_state(BookingState.choosing_slot)
+    await message.answer("Выберите время слота:", reply_markup=keyboards.slots_keyboard(slots))
+
+
+@router.message(BookingState.choosing_slot)
+async def choose_slot(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    slots: list[str] = data.get("slots", [])
+    if message.text not in slots:
+        await message.answer("Выберите время из списка.")
+        return
+    await state.update_data(slot_time=message.text)
+    await state.set_state(BookingState.entering_license_plate)
+    await message.answer("Введите номер грузовика (госномер):", reply_markup=keyboards.remove_keyboard())
+
+
+@router.message(BookingState.entering_license_plate)
+async def enter_license(message: Message, state: FSMContext) -> None:
+    plate = message.text.strip()
+    if not plate:
+        await message.answer("Номер не может быть пустым.")
+        return
+    await state.update_data(license_plate=plate)
+    data = await state.get_data()
+    text = (
+        "Подтвердите бронирование:\n"
+        f"Элеватор: {data.get('elevator_id')}\n"
+        f"Дата: {data.get('date')}\n"
+        f"Время: {data.get('slot_time')}\n"
+        f"Номер: {plate}"
+    )
+    await state.set_state(BookingState.confirming)
+    await message.answer(text, reply_markup=keyboards.confirmation_keyboard())
+
+
+@router.message(BookingState.confirming)
+async def confirm_booking(message: Message, state: FSMContext) -> None:
+    if message.text not in {"Подтвердить", "Отмена"}:
+        await message.answer("Выберите действие: Подтвердить или Отмена.")
+        return
+    if message.text == "Отмена":
+        await state.clear()
+        await message.answer("Бронирование отменено.", reply_markup=keyboards.remove_keyboard())
+        return
+
+    data = await state.get_data()
+    with SessionLocal() as session:
+        elevator = session.query(Elevator).get(data["elevator_id"])
+        if elevator is None:
+            await message.answer("Элеватор не найден. Начните заново /book.")
+            await state.clear()
+            return
+        booking_date = parse_date(data["date"])
+        available_slots = _available_slots(session, elevator, booking_date)
+        if data["slot_time"] not in available_slots:
+            await message.answer("Слот уже занят, выберите другой /book.")
+            await state.clear()
+            return
+
+        driver = _get_or_create_driver(session, message.from_user.id, message.from_user.username)
+        slot_hour, slot_minute = map(int, data["slot_time"].split(":"))
+        slot_time = elevator.work_day_start.replace(hour=slot_hour, minute=slot_minute, second=0, microsecond=0)
+        slot_start_dt = combine_date_time(booking_date, slot_time)
+        slot_end_dt = slot_start_dt + timedelta(hours=1)
+        booking = Booking(
+            driver_id=driver.id,
+            elevator_id=elevator.id,
+            license_plate=data["license_plate"],
+            date=booking_date,
+            slot_start=slot_start_dt,
+            slot_end=slot_end_dt,
+            status=BookingStatus.CONFIRMED,
+        )
+        session.add(booking)
+        session.flush()
+        recalc_queue(session, elevator.id, booking_date)
+        session.commit()
+        await state.clear()
+        await message.answer(
+            f"Бронирование подтверждено.\nЭлеватор: {elevator.name}\nДата: {booking_date}\nВремя: {data['slot_time']}\nНомер: {booking.license_plate}\nВаша позиция в очереди: {booking.queue_index}",
+            reply_markup=keyboards.remove_keyboard(),
+        )
