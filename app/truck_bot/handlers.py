@@ -7,6 +7,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import Booking, BookingStatus, Driver, Elevator
 from app.queue_logic import recalc_queue
@@ -204,7 +205,7 @@ async def confirm_booking(message: Message, state: FSMContext) -> None:
         slot_hour, slot_minute = map(int, data["slot_time"].split(":"))
         slot_time = elevator.work_day_start.replace(hour=slot_hour, minute=slot_minute, second=0, microsecond=0)
         slot_start_dt = combine_date_time(booking_date, slot_time)
-        slot_end_dt = slot_start_dt + timedelta(hours=1)
+        slot_end_dt = slot_start_dt + timedelta(minutes=settings.slot_duration_minutes)
         booking = Booking(
             driver_id=driver.id,
             elevator_id=elevator.id,

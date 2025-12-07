@@ -20,6 +20,7 @@ class Settings:
     database_url: str
     notification_poll_interval_seconds: int
     default_timezone: str
+    slot_duration_minutes: int
 
 
 def load_settings() -> Settings:
@@ -31,6 +32,7 @@ def load_settings() -> Settings:
             _get_env("NOTIFICATION_POLL_INTERVAL_SECONDS", "30")
         ),
         default_timezone=_get_env("DEFAULT_TIMEZONE", "Europe/Moscow"),
+        slot_duration_minutes=int(_get_env("SLOT_DURATION_MINUTES", "60")),
     )
 
 

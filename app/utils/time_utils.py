@@ -22,8 +22,7 @@ def combine_date_time(day: date, t: time) -> datetime:
 
 
 def build_daily_slots(work_day_start: time, work_day_end: time, bookable_slots_per_day: int) -> list[tuple[time, time]]:
-    # Slot duration = 1 hour
-    duration = timedelta(hours=1)
+    duration = timedelta(minutes=settings.slot_duration_minutes)
     slots: list[tuple[time, time]] = []
     tz = work_day_start.tzinfo or get_timezone()
     current = datetime.combine(date.today(), work_day_start, tzinfo=tz)

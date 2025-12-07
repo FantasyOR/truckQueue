@@ -16,7 +16,13 @@ def recalc_queue(session: Session, elevator_id: int, booking_date: date) -> list
             Booking.date == booking_date,
             Booking.status != BookingStatus.CANCELLED,
         )
-        .order_by(Booking.slot_start, Booking.created_at, Booking.id)
+        # Ставим записи без created_at (вновь добавленные) после уже существующих
+        .order_by(
+            Booking.slot_start,
+            Booking.created_at.is_(None),
+            Booking.created_at,
+            Booking.id,
+        )
     )
     bookings = list(session.scalars(stmt).all())
     for idx, booking in enumerate(bookings):
