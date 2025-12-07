@@ -17,6 +17,7 @@ def _get_env(name: str, default: str | None = None) -> str:
 class Settings:
     truck_bot_token: str
     elevator_bot_token: str
+    elevator_target_id: int | None
     database_url: str
     notification_poll_interval_seconds: int
     default_timezone: str
@@ -24,9 +25,11 @@ class Settings:
 
 
 def load_settings() -> Settings:
+    raw_target = os.getenv("ELEVATOR_TARGET_ID")
     return Settings(
         truck_bot_token=_get_env("TRUCK_BOT_TOKEN", ""),
         elevator_bot_token=_get_env("ELEVATOR_BOT_TOKEN", ""),
+        elevator_target_id=int(raw_target) if raw_target else None,
         database_url=_get_env("DATABASE_URL", "sqlite:///queue.db"),
         notification_poll_interval_seconds=int(
             _get_env("NOTIFICATION_POLL_INTERVAL_SECONDS", "30")

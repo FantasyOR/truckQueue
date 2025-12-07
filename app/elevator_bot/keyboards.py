@@ -13,3 +13,9 @@ def booking_actions_keyboard(booking_id: int) -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def elevators_keyboard(elevators: list[str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=name, callback_data=f"elevator:{name}") for name in elevators]]
+    )

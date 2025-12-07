@@ -5,10 +5,12 @@ from io import BytesIO
 
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from app.db import SessionLocal
-from app.elevator_bot.keyboards import booking_actions_keyboard
+from app.elevator_bot.keyboards import booking_actions_keyboard, elevators_keyboard
+from app.elevator_bot.states import ElevatorState
 from app.models import Booking, BookingStatus, Elevator
 from app.queue_logic import recalc_queue
 from app.utils.csv_export import bookings_to_csv
@@ -31,21 +33,62 @@ def _format_booking(booking: Booking) -> str:
     )
 
 
+async def _select_elevator_prompt(message: Message, state: FSMContext) -> None:
+    with SessionLocal() as session:
+        elevators = [e.name for e in session.query(Elevator).order_by(Elevator.name).all()]
+    if not elevators:
+        await message.answer("Нет настроенных элеваторов. Добавьте в базе.")
+        return
+    await state.set_state(ElevatorState.choosing_elevator)
+    await message.answer("Выберите элеватор для работы:", reply_markup=elevators_keyboard(elevators))
+
+
+async def _get_selected_elevator_id(state: FSMContext) -> int | None:
+    data = await state.get_data()
+    return data.get("elevator_id")
+
+
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
-    await message.answer(
-        "Бот диспетчера. Команды: /today — сегодняшние бронирования, /schedule — расписание на 3 дня, /export — CSV за сегодня."
-    )
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _select_elevator_prompt(message, state)
+
+
+@router.message(Command("change_elevator"))
+async def cmd_change_elevator(message: Message, state: FSMContext) -> None:
+    await _select_elevator_prompt(message, state)
+
+
+@router.callback_query(F.data.startswith("elevator:"))
+async def choose_elevator(call: CallbackQuery, state: FSMContext) -> None:
+    name = call.data.split(":", 1)[1]
+    with SessionLocal() as session:
+        elevator = session.query(Elevator).filter_by(name=name).one_or_none()
+    if elevator is None:
+        await call.answer("Элеватор не найден", show_alert=True)
+        return
+    await state.update_data(elevator_id=elevator.id)
+    await state.set_state(None)
+    await call.message.edit_text(f"Элеватор выбран: {name}\nКоманды: /today, /schedule, /export")
+    await call.answer()
 
 
 @router.message(Command("today"))
-async def cmd_today(message: Message) -> None:
+async def cmd_today(message: Message, state: FSMContext) -> None:
+    elevator_id = await _get_selected_elevator_id(state)
+    if not elevator_id:
+        await _select_elevator_prompt(message, state)
+        return
     today = date.today()
     with SessionLocal() as session:
         bookings = (
             session.query(Booking)
             .join(Elevator)
-            .filter(Booking.date == today, Booking.status != BookingStatus.CANCELLED)
+            .filter(
+                Booking.date == today,
+                Booking.status != BookingStatus.CANCELLED,
+                Booking.elevator_id == elevator_id,
+            )
             .order_by(Booking.slot_start)
             .all()
         )
@@ -57,7 +100,11 @@ async def cmd_today(message: Message) -> None:
 
 
 @router.message(Command("schedule"))
-async def cmd_schedule(message: Message) -> None:
+async def cmd_schedule(message: Message, state: FSMContext) -> None:
+    elevator_id = await _get_selected_elevator_id(state)
+    if not elevator_id:
+        await _select_elevator_prompt(message, state)
+        return
     start_day = date.today()
     end_day = start_day + timedelta(days=3)
     with SessionLocal() as session:
@@ -68,6 +115,7 @@ async def cmd_schedule(message: Message) -> None:
                 Booking.date >= start_day,
                 Booking.date <= end_day,
                 Booking.status != BookingStatus.CANCELLED,
+                Booking.elevator_id == elevator_id,
             )
             .order_by(Booking.slot_start)
             .all()
@@ -82,12 +130,19 @@ async def cmd_schedule(message: Message) -> None:
 
 
 @router.message(Command("export"))
-async def cmd_export(message: Message) -> None:
+async def cmd_export(message: Message, state: FSMContext) -> None:
+    elevator_id = await _get_selected_elevator_id(state)
+    if not elevator_id:
+        await _select_elevator_prompt(message, state)
+        return
     today = date.today()
     with SessionLocal() as session:
         bookings = (
             session.query(Booking)
-            .filter(Booking.date == today)
+            .filter(
+                Booking.date == today,
+                Booking.elevator_id == elevator_id,
+            )
             .order_by(Booking.slot_start)
             .all()
         )
@@ -100,10 +155,15 @@ async def cmd_export(message: Message) -> None:
 @router.callback_query(F.data.startswith("arrive:"))
 async def mark_arrived(call: CallbackQuery) -> None:
     booking_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    elevator_id = data.get("elevator_id")
     with SessionLocal() as session:
         booking = session.get(Booking, booking_id)
         if booking is None:
             await call.answer("Бронирование не найдено", show_alert=True)
+            return
+        if elevator_id and booking.elevator_id != elevator_id:
+            await call.answer("Недоступно для этого бота", show_alert=True)
             return
         booking.arrived_at = now_tz()
         booking.status = BookingStatus.ARRIVED
@@ -116,10 +176,15 @@ async def mark_arrived(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("unload:"))
 async def mark_unloaded(call: CallbackQuery) -> None:
     booking_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    elevator_id = data.get("elevator_id")
     with SessionLocal() as session:
         booking = session.get(Booking, booking_id)
         if booking is None:
             await call.answer("Бронирование не найдено", show_alert=True)
+            return
+        if elevator_id and booking.elevator_id != elevator_id:
+            await call.answer("Недоступно для этого бота", show_alert=True)
             return
         booking.unloaded_at = now_tz()
         booking.status = BookingStatus.UNLOADED
@@ -131,10 +196,15 @@ async def mark_unloaded(call: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("cancel:"))
 async def mark_cancelled(call: CallbackQuery) -> None:
     booking_id = int(call.data.split(":")[1])
+    data = await state.get_data()
+    elevator_id = data.get("elevator_id")
     with SessionLocal() as session:
         booking = session.get(Booking, booking_id)
         if booking is None:
             await call.answer("Бронирование не найдено", show_alert=True)
+            return
+        if elevator_id and booking.elevator_id != elevator_id:
+            await call.answer("Недоступно для этого бота", show_alert=True)
             return
         booking.cancelled_at = now_tz()
         booking.status = BookingStatus.CANCELLED
