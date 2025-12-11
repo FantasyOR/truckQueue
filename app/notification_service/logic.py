@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Booking, BookingStatus, Notification, Driver
 from app.queue_logic import recalc_queue
-from app.utils.time_utils import now_tz
+from app.utils.time_utils import now_tz, get_timezone
 
 
 NOTIF_CONFIRMED = "CONFIRMED"
@@ -35,6 +35,7 @@ def _already_sent(session: Session, booking_id: int, notif_type: str) -> bool:
 
 async def process_notifications(session: Session, bot: Bot) -> None:
     now = now_tz()
+    tz = get_timezone()
 
     # Recalculate queues for all active days/elevators
     pairs = (
@@ -58,6 +59,13 @@ async def process_notifications(session: Session, bot: Bot) -> None:
         driver = booking.driver
         if driver is None:
             continue
+        slot_start = booking.slot_start
+        if slot_start.tzinfo is None:
+            slot_start = slot_start.replace(tzinfo=tz)
+        else:
+            slot_start = slot_start.astimezone(tz)
+        booking.slot_start = slot_start
+        session.add(booking)
 
         # Confirmation
         if not _already_sent(session, booking.id, NOTIF_CONFIRMED):
@@ -70,27 +78,27 @@ async def process_notifications(session: Session, bot: Bot) -> None:
 
         # Reminder 24h
         if (
-            booking.slot_start - now <= timedelta(hours=24)
-            and booking.slot_start > now
+            slot_start - now <= timedelta(hours=24)
+            and slot_start > now
             and not _already_sent(session, booking.id, NOTIF_REMINDER_24H)
         ):
             await send_notification(
                 bot,
                 driver.telegram_user_id,
-                f"Напоминание: завтра {booking.date} в {booking.slot_start.strftime('%H:%M')} элеватор {booking.elevator.name}",
+                f"Напоминание: завтра {booking.date} в {slot_start.strftime('%H:%M')} элеватор {booking.elevator.name}",
             )
             session.add(Notification(booking_id=booking.id, notification_type=NOTIF_REMINDER_24H))
 
         # Reminder 1h
         if (
-            booking.slot_start - now <= timedelta(hours=1)
-            and booking.slot_start > now
+            slot_start - now <= timedelta(hours=1)
+            and slot_start > now
             and not _already_sent(session, booking.id, NOTIF_REMINDER_1H)
         ):
             await send_notification(
                 bot,
                 driver.telegram_user_id,
-                f"Напоминание: через час слот {booking.slot_start.strftime('%H:%M')} на элеваторе {booking.elevator.name}",
+                f"Напоминание: через час слот {slot_start.strftime('%H:%M')} на элеваторе {booking.elevator.name}",
             )
             session.add(Notification(booking_id=booking.id, notification_type=NOTIF_REMINDER_1H))
 

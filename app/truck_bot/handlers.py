@@ -90,7 +90,7 @@ async def cmd_my_bookings(message: Message) -> None:
         for b in bookings:
             status = b.status
             lines.append(
-                f"{b.date.isoformat()} {b.slot_start.astimezone(now.tzinfo).strftime('%H:%M')} — элеватор {b.elevator.name}, номер {b.license_plate}, статус {status}, позиция {b.queue_index}"
+                f"{b.date.isoformat()} {b.slot_start.astimezone(now.tzinfo).strftime('%H:%M')} — элеватор {b.elevator.name}, номер {b.license_plate}, статус {status}"
             )
         await message.answer("\n".join(lines))
 
@@ -221,6 +221,10 @@ async def confirm_booking(message: Message, state: FSMContext) -> None:
         session.commit()
         await state.clear()
         await message.answer(
-            f"Бронирование подтверждено.\nЭлеватор: {elevator.name}\nДата: {booking_date}\nВремя: {data['slot_time']}\nНомер: {booking.license_plate}\nВаша позиция в очереди: {booking.queue_index}",
+            "Бронирование подтверждено.\n"
+            f"Элеватор: {elevator.name}\n"
+            f"Дата: {booking_date}\n"
+            f"Время: {data['slot_time']}\n"
+            f"Номер: {booking.license_plate}",
             reply_markup=keyboards.remove_keyboard(),
         )

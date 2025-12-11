@@ -25,7 +25,7 @@ def _format_booking(booking: Booking) -> str:
     slot_local = booking.slot_start.astimezone(tz_now.tzinfo)
     status = booking.status
     return (
-        f"#{booking.id} | {slot_local.strftime('%Y-%m-%d %H:%M')} | позиция {booking.queue_index}\n"
+        f"#{booking.id} | {slot_local.strftime('%Y-%m-%d %H:%M')}\n"
         f"Элеватор: {booking.elevator.name}\n"
         f"Номер: {booking.license_plate}\n"
         f"Водитель: @{booking.driver.telegram_username or booking.driver.telegram_user_id}\n"
@@ -96,7 +96,10 @@ async def cmd_today(message: Message, state: FSMContext) -> None:
             await message.answer("На сегодня бронирований нет.")
             return
         for booking in bookings:
-            await message.answer(_format_booking(booking), reply_markup=booking_actions_keyboard(booking.id))
+            markup = booking_actions_keyboard(booking)
+            await message.answer(
+                _format_booking(booking), reply_markup=markup
+            )
 
 
 @router.message(Command("schedule"))
@@ -123,9 +126,7 @@ async def cmd_schedule(message: Message, state: FSMContext) -> None:
         if not bookings:
             await message.answer("Нет бронирований в ближайшие дни.")
             return
-        lines = []
-        for booking in bookings:
-            lines.append(_format_booking(booking))
+        lines = [_format_booking(b) for b in bookings]
         await message.answer("\n\n".join(lines))
 
 
@@ -153,7 +154,7 @@ async def cmd_export(message: Message, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data.startswith("arrive:"))
-async def mark_arrived(call: CallbackQuery) -> None:
+async def mark_arrived(call: CallbackQuery, state: FSMContext) -> None:
     booking_id = int(call.data.split(":")[1])
     data = await state.get_data()
     elevator_id = data.get("elevator_id")
@@ -169,12 +170,13 @@ async def mark_arrived(call: CallbackQuery) -> None:
         booking.status = BookingStatus.ARRIVED
         recalc_queue(session, booking.elevator_id, booking.date)
         session.commit()
-        await call.message.edit_text(_format_booking(booking), reply_markup=booking_actions_keyboard(booking.id))
+        markup = booking_actions_keyboard(booking)
+        await call.message.edit_text(_format_booking(booking), reply_markup=markup)
         await call.answer("Прибытие отмечено")
 
 
 @router.callback_query(F.data.startswith("unload:"))
-async def mark_unloaded(call: CallbackQuery) -> None:
+async def mark_unloaded(call: CallbackQuery, state: FSMContext) -> None:
     booking_id = int(call.data.split(":")[1])
     data = await state.get_data()
     elevator_id = data.get("elevator_id")
@@ -189,12 +191,13 @@ async def mark_unloaded(call: CallbackQuery) -> None:
         booking.unloaded_at = now_tz()
         booking.status = BookingStatus.UNLOADED
         session.commit()
-        await call.message.edit_text(_format_booking(booking), reply_markup=booking_actions_keyboard(booking.id))
+        markup = booking_actions_keyboard(booking)
+        await call.message.edit_text(_format_booking(booking), reply_markup=markup)
         await call.answer("Выгрузка отмечена")
 
 
 @router.callback_query(F.data.startswith("cancel:"))
-async def mark_cancelled(call: CallbackQuery) -> None:
+async def mark_cancelled(call: CallbackQuery, state: FSMContext) -> None:
     booking_id = int(call.data.split(":")[1])
     data = await state.get_data()
     elevator_id = data.get("elevator_id")
@@ -210,5 +213,9 @@ async def mark_cancelled(call: CallbackQuery) -> None:
         booking.status = BookingStatus.CANCELLED
         recalc_queue(session, booking.elevator_id, booking.date)
         session.commit()
-        await call.message.edit_text(_format_booking(booking))
+        markup = booking_actions_keyboard(booking)
+        if markup:
+            await call.message.edit_text(_format_booking(booking), reply_markup=markup)
+        else:
+            await call.message.edit_text(_format_booking(booking))
         await call.answer("Бронирование отменено")
