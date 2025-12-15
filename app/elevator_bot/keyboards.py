@@ -22,20 +22,29 @@ def booking_actions_keyboard(booking: Booking) -> InlineKeyboardMarkup | None:
         disabled.add("unload")
     if booking.status == BookingStatus.CANCELLED:
         disabled.add("cancel")
+    if booking.status == BookingStatus.UNLOADED:
+        return None
 
     rows: list[list[InlineKeyboardButton]] = []
     action_row: list[InlineKeyboardButton] = []
-    if "arrive" not in disabled:
+    show_arrive = booking.status not in (
+        BookingStatus.ARRIVED,
+        BookingStatus.UNLOADED,
+        BookingStatus.CANCELLED,
+    )
+    show_unload = booking.status in (BookingStatus.ARRIVED,)
+
+    if show_arrive:
         action_row.append(
             InlineKeyboardButton(text="Прибыл", callback_data=f"arrive:{booking.id}")
         )
-    if "unload" not in disabled:
+    if show_unload and "unload" not in disabled:
         action_row.append(
-            InlineKeyboardButton(text="Разгрузка", callback_data=f"unload:{booking.id}")
+            InlineKeyboardButton(text="Разгрузился", callback_data=f"unload:{booking.id}")
         )
     if action_row:
         rows.append(action_row)
-    if "cancel" not in disabled:
+    if "cancel" not in disabled and not show_unload:
         rows.append(
             [InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{booking.id}")]
         )
@@ -45,14 +54,16 @@ def booking_actions_keyboard(booking: Booking) -> InlineKeyboardMarkup | None:
 
 
 def elevators_keyboard(elevators: list[str]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=name, callback_data=f"elevator:{name}") for name in elevators]]
-    )
+    rows = [
+        [InlineKeyboardButton(text=name, callback_data=f"elevator:{name}")]
+        for name in elevators
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     buttons = [
-        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Расписание")],
-        [KeyboardButton(text="Экспорт"), KeyboardButton(text="Сменить элеватор")],
+        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Завтра")],
+        [KeyboardButton(text="Сменить элеватор")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)

@@ -119,7 +119,10 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
     with SessionLocal() as session:
         elevators = session.query(Elevator).order_by(Elevator.name).all()
         if not elevators:
-            await message.answer("Элеваторы не настроены. Свяжитесь с диспетчером.")
+            await message.answer(
+                "Элеваторы не настроены. Свяжитесь с диспетчером.",
+                reply_markup=keyboards.main_menu_keyboard(),
+            )
             return
     await state.set_state(BookingState.choosing_elevator)
     await message.answer("Выберите элеватор:", reply_markup=keyboards.elevators_keyboard(elevators))
@@ -288,6 +291,7 @@ async def confirm_booking(message: Message, state: FSMContext) -> None:
     if message.text == "Отмена":
         await state.clear()
         await message.answer("Бронирование отменено.", reply_markup=keyboards.remove_keyboard())
+        await message.answer("Что дальше?", reply_markup=keyboards.main_menu_keyboard())
         return
 
     data = await state.get_data()
@@ -296,12 +300,14 @@ async def confirm_booking(message: Message, state: FSMContext) -> None:
         if elevator is None:
             await message.answer("Элеватор не найден. Начните заново /book.")
             await state.clear()
+            await message.answer("Выберите действие:", reply_markup=keyboards.main_menu_keyboard())
             return
         booking_date = parse_date(data["date"])
         available_slots = _available_slots(session, elevator, booking_date)
         if data["slot_time"] not in available_slots:
             await message.answer("Слот уже занят, выберите другой /book.")
             await state.clear()
+            await message.answer("Выберите действие:", reply_markup=keyboards.main_menu_keyboard())
             return
 
         driver = _get_or_create_driver(session, message.from_user.id, message.from_user.username)
@@ -329,5 +335,5 @@ async def confirm_booking(message: Message, state: FSMContext) -> None:
             f"Дата: {booking_date}\n"
             f"Время: {data['slot_time']}\n"
             f"Номер: {booking.license_plate}",
-            reply_markup=keyboards.remove_keyboard(),
+            reply_markup=keyboards.main_menu_keyboard(),
         )

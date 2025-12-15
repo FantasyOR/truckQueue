@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from io import BytesIO
 import asyncio
 
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import CallbackQuery, Message
 
 from app.db import SessionLocal
 from app.elevator_bot.keyboards import (
@@ -18,7 +17,6 @@ from app.elevator_bot.keyboards import (
 from app.elevator_bot.states import ElevatorState
 from app.models import Booking, BookingStatus, Elevator
 from app.queue_logic import recalc_queue
-from app.utils.csv_export import bookings_to_csv
 from app.utils.time_utils import now_tz
 from app.truck_bot import keyboards as driver_keyboards
 from aiogram import Bot
@@ -124,15 +122,13 @@ async def cmd_schedule(message: Message, state: FSMContext) -> None:
     if not elevator_id:
         await _select_elevator_prompt(message, state)
         return
-    start_day = date.today()
-    end_day = start_day + timedelta(days=3)
+    target_day = date.today() + timedelta(days=1)
     with SessionLocal() as session:
         bookings = (
             session.query(Booking)
             .join(Elevator)
             .filter(
-                Booking.date >= start_day,
-                Booking.date <= end_day,
+                Booking.date == target_day,
                 Booking.status != BookingStatus.CANCELLED,
                 Booking.elevator_id == elevator_id,
             )
@@ -140,33 +136,10 @@ async def cmd_schedule(message: Message, state: FSMContext) -> None:
             .all()
         )
         if not bookings:
-            await message.answer("Нет бронирований в ближайшие дни.")
+            await message.answer("На завтра бронирований нет.")
             return
-        lines = [_format_booking(b) for b in bookings]
-        await message.answer("\n\n".join(lines))
-
-
-@router.message(Command("export"))
-async def cmd_export(message: Message, state: FSMContext) -> None:
-    elevator_id = await _get_selected_elevator_id(state)
-    if not elevator_id:
-        await _select_elevator_prompt(message, state)
-        return
-    today = date.today()
-    with SessionLocal() as session:
-        bookings = (
-            session.query(Booking)
-            .filter(
-                Booking.date == today,
-                Booking.elevator_id == elevator_id,
-            )
-            .order_by(Booking.slot_start)
-            .all()
-        )
-        data = bookings_to_csv(bookings)
-    buffer = BytesIO(data)
-    buffer.seek(0)
-    await message.answer_document(FSInputFile(buffer, filename=f"schedule_{today}.csv"))
+        for booking in bookings:
+            await message.answer(_format_booking(booking))
 
 
 @router.message(F.text.casefold() == "сегодня")
@@ -174,14 +147,9 @@ async def menu_today(message: Message, state: FSMContext) -> None:
     await cmd_today(message, state)
 
 
-@router.message(F.text.casefold() == "расписание")
+@router.message(F.text.casefold() == "завтра")
 async def menu_schedule(message: Message, state: FSMContext) -> None:
     await cmd_schedule(message, state)
-
-
-@router.message(F.text.casefold() == "экспорт")
-async def menu_export(message: Message, state: FSMContext) -> None:
-    await cmd_export(message, state)
 
 
 @router.message(F.text.casefold() == "сменить элеватор")
