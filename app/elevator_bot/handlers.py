@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from io import BytesIO
+import asyncio
 
 from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
@@ -9,12 +10,19 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
 from app.db import SessionLocal
-from app.elevator_bot.keyboards import booking_actions_keyboard, elevators_keyboard
+from app.elevator_bot.keyboards import (
+    booking_actions_keyboard,
+    elevators_keyboard,
+    main_menu_keyboard,
+)
 from app.elevator_bot.states import ElevatorState
 from app.models import Booking, BookingStatus, Elevator
 from app.queue_logic import recalc_queue
 from app.utils.csv_export import bookings_to_csv
 from app.utils.time_utils import now_tz
+from app.truck_bot import keyboards as driver_keyboards
+from aiogram import Bot
+from app.config import settings
 
 
 router = Router()
@@ -23,7 +31,14 @@ router = Router()
 def _format_booking(booking: Booking) -> str:
     tz_now = now_tz()
     slot_local = booking.slot_start.astimezone(tz_now.tzinfo)
-    status = booking.status
+    status_map = {
+        BookingStatus.PENDING: "Запрос",
+        BookingStatus.CONFIRMED: "Записан",
+        BookingStatus.ARRIVED: "Прибыл",
+        BookingStatus.UNLOADED: "Разгружен",
+        BookingStatus.CANCELLED: "Отменён",
+    }
+    status = status_map.get(booking.status, booking.status)
     return (
         f"#{booking.id} | {slot_local.strftime('%Y-%m-%d %H:%M')}\n"
         f"Элеватор: {booking.elevator.name}\n"
@@ -69,7 +84,8 @@ async def choose_elevator(call: CallbackQuery, state: FSMContext) -> None:
         return
     await state.update_data(elevator_id=elevator.id)
     await state.set_state(None)
-    await call.message.edit_text(f"Элеватор выбран: {name}\nКоманды: /today, /schedule, /export")
+    await call.message.edit_text(f"Элеватор выбран: {name}\nИспользуйте кнопки ниже.")
+    await call.message.answer("Выберите действие:", reply_markup=main_menu_keyboard())
     await call.answer()
 
 
@@ -153,6 +169,26 @@ async def cmd_export(message: Message, state: FSMContext) -> None:
     await message.answer_document(FSInputFile(buffer, filename=f"schedule_{today}.csv"))
 
 
+@router.message(F.text.casefold() == "сегодня")
+async def menu_today(message: Message, state: FSMContext) -> None:
+    await cmd_today(message, state)
+
+
+@router.message(F.text.casefold() == "расписание")
+async def menu_schedule(message: Message, state: FSMContext) -> None:
+    await cmd_schedule(message, state)
+
+
+@router.message(F.text.casefold() == "экспорт")
+async def menu_export(message: Message, state: FSMContext) -> None:
+    await cmd_export(message, state)
+
+
+@router.message(F.text.casefold() == "сменить элеватор")
+async def menu_change_elevator(message: Message, state: FSMContext) -> None:
+    await cmd_change_elevator(message, state)
+
+
 @router.callback_query(F.data.startswith("arrive:"))
 async def mark_arrived(call: CallbackQuery, state: FSMContext) -> None:
     booking_id = int(call.data.split(":")[1])
@@ -194,6 +230,7 @@ async def mark_unloaded(call: CallbackQuery, state: FSMContext) -> None:
         markup = booking_actions_keyboard(booking)
         await call.message.edit_text(_format_booking(booking), reply_markup=markup)
         await call.answer("Выгрузка отмечена")
+        await _offer_next_now(session, booking)
 
 
 @router.callback_query(F.data.startswith("cancel:"))
@@ -219,3 +256,44 @@ async def mark_cancelled(call: CallbackQuery, state: FSMContext) -> None:
         else:
             await call.message.edit_text(_format_booking(booking))
         await call.answer("Бронирование отменено")
+
+
+def _offer_next_now(session, unloaded_booking: Booking) -> None:
+    """
+    Notify next in queue (and optionally second if first declines).
+    """
+    if not unloaded_booking:
+        return
+    today = unloaded_booking.date
+    recalc_queue(session, unloaded_booking.elevator_id, today)
+    session.flush()
+    # получаем список очереди без отмененных/разгруженных
+    candidates = (
+        session.query(Booking)
+        .filter(
+            Booking.elevator_id == unloaded_booking.elevator_id,
+            Booking.date == today,
+            Booking.status.notin_([BookingStatus.CANCELLED, BookingStatus.UNLOADED]),
+        )
+        .order_by(Booking.queue_index)
+        .all()
+    )
+    if not candidates:
+        return
+    first = candidates[0]
+    fallback = candidates[1].id if len(candidates) > 1 else None
+
+    driver = first.driver
+    if driver is None:
+        return
+    bot = Bot(token=settings.truck_bot_token)
+    text = (
+        "Слот освободился. Можете подъехать сейчас?\n"
+        f"Элеватор: {first.elevator.name}\n"
+        f"Бронь: {first.date} {first.slot_start.strftime('%H:%M')}"
+    )
+    markup = driver_keyboards.inline_offer_keyboard(first.id, fallback)
+    # fire and forget
+    asyncio.get_event_loop().create_task(
+        bot.send_message(driver.telegram_user_id, text, reply_markup=markup)
+    )

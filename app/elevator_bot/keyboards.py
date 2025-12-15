@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.models import Booking, BookingStatus
 
@@ -43,3 +48,11 @@ def elevators_keyboard(elevators: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=name, callback_data=f"elevator:{name}") for name in elevators]]
     )
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    buttons = [
+        [KeyboardButton(text="Сегодня"), KeyboardButton(text="Расписание")],
+        [KeyboardButton(text="Экспорт"), KeyboardButton(text="Сменить элеватор")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)

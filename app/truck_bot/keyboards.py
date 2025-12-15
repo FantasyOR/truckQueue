@@ -1,6 +1,12 @@
 from datetime import date, timedelta
 
-from aiogram.types import KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from app.models import Elevator
 
@@ -35,3 +41,26 @@ def confirmation_keyboard() -> ReplyKeyboardMarkup:
 
 def remove_keyboard() -> ReplyKeyboardRemove:
     return ReplyKeyboardRemove()
+
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    buttons = [
+        [
+            KeyboardButton(text="Записаться"),
+            KeyboardButton(text="Мои бронирования"),
+        ],
+        [KeyboardButton(text="Помощь")],
+    ]
+    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
+
+
+def inline_offer_keyboard(booking_id: int, fallback_id: int | None) -> InlineKeyboardMarkup:
+    data_yes = f"come:yes:{booking_id}"
+    data_no = f"come:no:{booking_id}:{fallback_id or 0}"
+    buttons = [
+        [
+            InlineKeyboardButton(text="Да, еду", callback_data=data_yes),
+            InlineKeyboardButton(text="Нет", callback_data=data_no),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

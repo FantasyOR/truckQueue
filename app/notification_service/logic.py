@@ -7,15 +7,10 @@ from aiogram import Bot
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models import Booking, BookingStatus, Notification, Driver
 from app.queue_logic import recalc_queue
 from app.utils.time_utils import now_tz, get_timezone
-
-
-NOTIF_CONFIRMED = "CONFIRMED"
-NOTIF_REMINDER_24H = "REMINDER_24H"
-NOTIF_REMINDER_1H = "REMINDER_1H"
-NOTIF_QUEUE_POSITION = "QUEUE_POSITION_CHANGED"
 
 
 async def send_notification(bot: Bot, chat_id: int, text: str) -> None:
@@ -33,9 +28,21 @@ def _already_sent(session: Session, booking_id: int, notif_type: str) -> bool:
     return session.scalars(stmt).first() is not None
 
 
+def _notif_type_for_offset(minutes: int) -> str:
+    return f"REMINDER_{minutes}M"
+
+
+def _human_offset(minutes: int) -> str:
+    if minutes >= 60 and minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} ч"
+    return f"{minutes} мин"
+
+
 async def process_notifications(session: Session, bot: Bot) -> None:
     now = now_tz()
     tz = get_timezone()
+    offsets = sorted({m for m in settings.notification_offsets_minutes if m > 0})
 
     # Recalculate queues for all active days/elevators
     pairs = (
@@ -67,49 +74,27 @@ async def process_notifications(session: Session, bot: Bot) -> None:
         booking.slot_start = slot_start
         session.add(booking)
 
-        # Confirmation
-        if not _already_sent(session, booking.id, NOTIF_CONFIRMED):
-            await send_notification(
-                bot,
-                driver.telegram_user_id,
-                f"Бронирование подтверждено: {booking.date} {booking.slot_start.strftime('%H:%M')} элеватор {booking.elevator.name}",
-            )
-            session.add(Notification(booking_id=booking.id, notification_type=NOTIF_CONFIRMED))
+        delta = slot_start - now
+        if delta <= timedelta(0):
+            continue
 
-        # Reminder 24h
-        if (
-            slot_start - now <= timedelta(hours=24)
-            and slot_start > now
-            and not _already_sent(session, booking.id, NOTIF_REMINDER_24H)
-        ):
+        due_offsets: list[int] = []
+        for minutes in offsets:
+            threshold = timedelta(minutes=minutes)
+            notif_type = _notif_type_for_offset(minutes)
+            if delta <= threshold and not _already_sent(session, booking.id, notif_type):
+                due_offsets.append(minutes)
+        if due_offsets:
+            minutes = min(due_offsets)  # отправляем только самое близкое по времени
+            notif_type = _notif_type_for_offset(minutes)
+            human_delta = _human_offset(minutes)
             await send_notification(
                 bot,
                 driver.telegram_user_id,
-                f"Напоминание: завтра {booking.date} в {slot_start.strftime('%H:%M')} элеватор {booking.elevator.name}",
+                f"Напоминание: слот {slot_start.strftime('%d.%m %H:%M')} на элеваторе {booking.elevator.name} через ≈{human_delta}.",
             )
-            session.add(Notification(booking_id=booking.id, notification_type=NOTIF_REMINDER_24H))
-
-        # Reminder 1h
-        if (
-            slot_start - now <= timedelta(hours=1)
-            and slot_start > now
-            and not _already_sent(session, booking.id, NOTIF_REMINDER_1H)
-        ):
-            await send_notification(
-                bot,
-                driver.telegram_user_id,
-                f"Напоминание: через час слот {slot_start.strftime('%H:%M')} на элеваторе {booking.elevator.name}",
+            session.add(
+                Notification(booking_id=booking.id, notification_type=notif_type)
             )
-            session.add(Notification(booking_id=booking.id, notification_type=NOTIF_REMINDER_1H))
-
-        # Queue position change
-        if booking.last_notified_queue_index != booking.queue_index:
-            await send_notification(
-                bot,
-                driver.telegram_user_id,
-                f"Ваша позиция в очереди изменилась: теперь {booking.queue_index}",
-            )
-            booking.last_notified_queue_index = booking.queue_index
-            session.add(Notification(booking_id=booking.id, notification_type=NOTIF_QUEUE_POSITION))
 
     session.commit()

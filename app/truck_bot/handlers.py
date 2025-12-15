@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 
-from aiogram import Router
+from aiogram import Router, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message
@@ -14,9 +14,19 @@ from app.queue_logic import recalc_queue
 from app.truck_bot import keyboards
 from app.truck_bot.states import BookingState
 from app.utils.time_utils import build_daily_slots, combine_date_time, now_tz, parse_date
+from aiogram.types import CallbackQuery
 
 
 router = Router()
+
+
+STATUS_TEXT = {
+    BookingStatus.PENDING: "Запрос",
+    BookingStatus.CONFIRMED: "Записан",
+    BookingStatus.ARRIVED: "Прибыл",
+    BookingStatus.UNLOADED: "Разгружен",
+    BookingStatus.CANCELLED: "Отменён",
+}
 
 
 def _get_or_create_driver(session, tg_user_id: int, tg_username: str | None) -> Driver:
@@ -40,9 +50,14 @@ def _available_slots(session, elevator: Elevator, booking_date: date) -> list[st
     )
     taken = {b.slot_start.timetz() for b in existing}
     slots = build_daily_slots(elevator.work_day_start, elevator.work_day_end, elevator.bookable_slots_per_day)
+    now = now_tz()
     available = []
     for slot_start, _ in slots:
         if slot_start not in taken:
+            if booking_date == now.date():
+                # не предлагать слоты, которые уже начались
+                if combine_date_time(booking_date, slot_start) <= now:
+                    continue
             available.append(slot_start.strftime("%H:%M"))
     return available
 
@@ -51,17 +66,20 @@ def _available_slots(session, elevator: Elevator, booking_date: date) -> list[st
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
-        "Привет! Я бот очереди на элеватор. Используй /book для бронирования, /my_bookings чтобы увидеть записи и /help для подсказок."
+        "Привет! Я бот очереди на элеватор.\n"
+        "Выберите действие кнопками ниже.",
+        reply_markup=keyboards.main_menu_keyboard(),
     )
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        "Доступные команды:\n"
-        "/book — забронировать слот\n"
-        "/my_bookings — мои бронирования\n"
-        "/help — справка"
+        "Доступные действия:\n"
+        "• Записаться — выбрать дату и слот.\n"
+        "• Мои бронирования — показать активные записи.\n"
+        "• Помощь — подсказка по шагам.",
+        reply_markup=keyboards.main_menu_keyboard(),
     )
 
 
@@ -88,11 +106,12 @@ async def cmd_my_bookings(message: Message) -> None:
             return
         lines = []
         for b in bookings:
-            status = b.status
+            status = STATUS_TEXT.get(b.status, b.status)
             lines.append(
                 f"{b.date.isoformat()} {b.slot_start.astimezone(now.tzinfo).strftime('%H:%M')} — элеватор {b.elevator.name}, номер {b.license_plate}, статус {status}"
             )
         await message.answer("\n".join(lines))
+    await message.answer("Выберите действие:", reply_markup=keyboards.main_menu_keyboard())
 
 
 @router.message(Command("book"))
@@ -104,6 +123,90 @@ async def cmd_book(message: Message, state: FSMContext) -> None:
             return
     await state.set_state(BookingState.choosing_elevator)
     await message.answer("Выберите элеватор:", reply_markup=keyboards.elevators_keyboard(elevators))
+    # no main menu here to keep focus on flow
+
+
+@router.message(F.text.casefold() == "записаться")
+async def menu_book(message: Message, state: FSMContext) -> None:
+    await cmd_book(message, state)
+
+
+@router.message(F.text.casefold() == "мои бронирования")
+async def menu_my_bookings(message: Message, state: FSMContext) -> None:
+    await cmd_my_bookings(message)
+
+
+@router.message(F.text.casefold() == "помощь")
+async def menu_help(message: Message, state: FSMContext) -> None:
+    await cmd_help(message)
+
+
+@router.callback_query(F.data.startswith("come:"))
+async def on_come_offer(callback: CallbackQuery) -> None:
+    """
+    Handle dispatcher offer to come now.
+    callback data: come:<action>:<booking_id>[:<fallback_id>]
+    """
+    parts = callback.data.split(":")
+    _, action, booking_id, *rest = parts
+    booking_id = int(booking_id)
+    fallback_id = int(rest[0]) if rest else None
+
+    with SessionLocal() as session:
+        booking = session.get(Booking, booking_id)
+        if booking is None:
+            await callback.answer("Бронь не найдена", show_alert=True)
+            return
+        if booking.driver.telegram_user_id != callback.from_user.id:
+            await callback.answer("Это предложение не для вас", show_alert=True)
+            return
+
+        if action == "yes":
+            now = now_tz()
+            booking.slot_start = now
+            booking.slot_end = now + timedelta(minutes=settings.slot_duration_minutes)
+            booking.updated_at = now
+            recalc_queue(session, booking.elevator_id, booking.date)
+            session.commit()
+            await callback.message.edit_text(
+                f"Спасибо! Подъезжайте сейчас.\n"
+                f"Элеватор: {booking.elevator.name}\n"
+                f"Слот: сейчас–{booking.slot_end.astimezone(now.tzinfo).strftime('%H:%M')}\n"
+                f"Номер: {booking.license_plate}"
+            )
+            await callback.answer("Принято")
+        elif action == "no":
+            session.commit()
+            await callback.message.edit_text("Вы отказались. Предложим следующему.")
+            await callback.answer("Отказ")
+            if fallback_id:
+                _notify_next_offer(session, fallback_id)
+        else:
+            await callback.answer()
+
+
+def _notify_next_offer(session, booking_id: int) -> None:
+    from aiogram import Bot
+
+    booking = session.get(Booking, booking_id)
+    if booking is None:
+        return
+    driver = booking.driver
+    if driver is None:
+        return
+    bot = Bot(settings.truck_bot_token)
+    text = (
+        f"Слот освободился. Можете подъехать сейчас?\n"
+        f"Элеватор: {booking.elevator.name}\n"
+        f"Бронь: {booking.date} {booking.slot_start.strftime('%H:%M')}\n"
+        "Принять предложение?"
+    )
+    fallback = ""
+    # no further offers beyond this one per требования
+    markup = keyboards.inline_offer_keyboard(booking.id, fallback_id=None)
+    asyncio.get_event_loop().create_task(
+        bot.send_message(driver.telegram_user_id, text, reply_markup=markup)
+    )
 
 
 @router.message(BookingState.choosing_elevator)
